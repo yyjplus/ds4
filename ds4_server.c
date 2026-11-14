@@ -11315,11 +11315,25 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
+/* Cold writes are capped at cold_max_tokens. A longer cold prompt has no
+ * checkpoint to fall back on: backends that only compute the output head at
+ * the end of prefill (DeepSeek V4.1) reject every mid-prefill staging request,
+ * so the continued frontier writes cannot land there. Detect that case so the
+ * completed prefill can still leave one full prompt prefix on disk. */
+static bool kv_cache_needs_full_cold_fallback(const kv_disk_cache *kc,
+                                              int cached, int cold_store_len,
+                                              int prompt_len) {
+    if (!kc || !kc->enabled || cached != 0 || cold_store_len != 0) return false;
+    if (kc->opt.cold_max_tokens <= 0) return false;
+    return prompt_len > kc->opt.cold_max_tokens &&
+           prompt_len >= kc->opt.min_tokens;
+}
+
+static bool kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
-    if (!s || !slot) return;
+    if (!s || !slot) return false;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return false;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -11351,12 +11365,13 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+        bool ok = kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len,
+                                                  reason, visible_text,
+                                                  visible_ext, visible_key);
         free(visible_text);
-    } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        return ok;
     }
+    return kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -11402,28 +11417,40 @@ static void kv_cache_slot_restore_suppressed(server_slot *slot,
     }
 }
 
-static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
-                                                const char *path) {
-    if (!s || !slot || !path) return;
-    pthread_mutex_lock(&s->kv_mu);
-    if (unlink(path) == 0) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: kv cache discarded reason=prefill-failed file=%s",
-                   path);
-    } else if (errno != ENOENT) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
-                   path, strerror(errno));
-    }
-    pthread_mutex_unlock(&s->kv_mu);
+/* A real prefill failure leaves the live session in an undetermined state, so
+ * drop its checkpoint. The disk snapshot this request loaded from is a
+ * separate, already-validated artifact: stores are atomic and the failed
+ * suffix was never written into it. Unlinking it here made one timeout
+ * permanent -- the next identical request lost its cache and had to prefill
+ * from token zero again. */
+static void kv_cache_note_failed_prefill(server *s, server_slot *slot) {
+    if (!s || !slot) return;
     slot->continued_last_store_tokens = 0;
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+/* Cooperative cancellation stops ds4_session_sync() at a chunk boundary and a
+ * complete prefix may remain usable; the next sync reuses or rebuilds it. A
+ * client timeout is therefore a pause, not a broken cache. Only a real
+ * backend error invalidates live state, and neither case drops disk entries. */
+static void kv_cache_note_prefill_failure(server *s, server_slot *slot,
+                                          int sync_rc) {
+    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) return;
+    kv_cache_note_failed_prefill(s, slot);
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
+    /* ds4_session_stage_payload() requires a valid checkpoint. Graph backends
+     * such as DeepSeek V4.1 deliberately keep the checkpoint invalid until the
+     * final output head is computed, so progress-callback frontiers during
+     * prefill can never be staged. Skip the render/SHA/stage work (and the
+     * repeated "no valid checkpoint to stage" log line) instead of trying a
+     * write that is guaranteed to fail; the post-prefill fallback below
+     * persists the completed prompt instead. */
+    if (!ds4_session_checkpoint_valid(slot->session)) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -13756,14 +13783,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        int cold_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            kv_cache_note_prefill_failure(s, slot, cold_sync_rc);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -13797,7 +13825,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        kv_cache_note_prefill_failure(s, slot, prompt_sync_rc);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
@@ -13824,7 +13852,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal) {
+        kv_cache_maybe_store_continued(s, slot);
+        /* A cold prompt longer than cold_max_tokens skips the cold path
+         * entirely, and mid-prefill continued writes cannot be staged on V4.1.
+         * Without this write the request leaves no reusable disk prefix and
+         * every repeat prefills the same long prompt from token zero. The
+         * checkpoint is stageable only now that prefill has finished. */
+        if (kv_cache_needs_full_cold_fallback(&s->kv, cached, cold_store_len,
+                                              prompt_for_sync->len)) {
+            const ds4_tokens *live = ds4_session_tokens(slot->session);
+            if (live && kv_cache_store_current(s, slot, "cold"))
+                kv_cache_slot_note_store(slot, live->len);
+        }
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -21716,6 +21757,75 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 }
 
+static void test_kv_cache_prefill_failure_preserves_disk_snapshot(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefill-failure-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    char *path = path_join(dir, "validated.kv");
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(path);
+        rmdir(dir);
+        return;
+    }
+    fputs("validated snapshot", fp);
+    fclose(fp);
+
+    server srv = {0};
+    pthread_mutex_init(&srv.inference_mu, NULL);
+    server_slot slot = {0};
+    int tokens[] = {1, 2, 3, 4};
+    slot.session = ds4_session_new_test_checkpoint(tokens, 4);
+    slot.continued_last_store_tokens = 4;
+
+    /* A timed-out client pauses at a chunk boundary. Keep the live prefix so
+     * the retry resumes instead of prefilling the same prompt from zero. */
+    kv_cache_note_prefill_failure(&srv, &slot, DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(ds4_session_checkpoint_valid(slot.session));
+    TEST_ASSERT(slot.continued_last_store_tokens == 4);
+    TEST_ASSERT(access(path, F_OK) == 0);
+
+    /* A real backend error drops the undetermined live checkpoint, but the
+     * snapshot loaded earlier is a separate validated artifact: deleting it
+     * would make the next identical request cold-start again. */
+    kv_cache_note_prefill_failure(&srv, &slot, 1);
+    TEST_ASSERT(!ds4_session_checkpoint_valid(slot.session));
+    TEST_ASSERT(slot.continued_last_store_tokens == 0);
+    TEST_ASSERT(access(path, F_OK) == 0);
+
+    ds4_session_free_test_checkpoint(slot.session);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+    pthread_mutex_destroy(&srv.inference_mu);
+}
+
+static void test_kv_cache_long_cold_prompt_uses_full_fallback(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options(); /* min=512, cold_max=30000 */
+
+    /* 45130 tokens exceeds cold_max and cannot be staged mid-prefill on V4.1:
+     * the completed prefill must still leave one full prompt prefix on disk. */
+    TEST_ASSERT(kv_cache_needs_full_cold_fallback(&kc, 0, 0, 45130));
+
+    /* A cache hit, an already-written cold prefix, a prompt under the cap,
+     * an explicitly disabled cold path, or a raised cap all skip the extra
+     * full-prompt write. */
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 4096, 0, 45130));
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 0, 28672, 45130));
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 0, 0, 2048));
+    kc.opt.cold_max_tokens = 0;
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 0, 0, 45130));
+    kc.opt.cold_max_tokens = 60000;
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 0, 0, 45130));
+    kc.enabled = false;
+    TEST_ASSERT(!kv_cache_needs_full_cold_fallback(&kc, 0, 0, 45130));
+}
+
 static void test_sha1_bytes_hex_matches_known_vector(void) {
     char sha[41];
     sha1_bytes_hex("abc", 3, sha);
@@ -23173,6 +23283,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
+    test_kv_cache_prefill_failure_preserves_disk_snapshot();
+    test_kv_cache_long_cold_prompt_uses_full_fallback();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
